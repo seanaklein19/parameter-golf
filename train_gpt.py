@@ -864,6 +864,11 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+
+    # QKV capture: per-layer hooks → Parquet (must be before torch.compile)
+    from qkv.capture import init as qkv_init
+    tracker = qkv_init(base_model, log_dir="logs", hook_filter="linear")
+
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1057,6 +1062,8 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        tracker.step(train_loss, scale)
+
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
@@ -1077,6 +1084,9 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
+
+    tracker.close()
+    log0(f"diagnostics written to {tracker.parquet_path}")
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
@@ -1152,6 +1162,7 @@ def main() -> None:
             "steps": step,
             "artifact_bytes": quant_file_bytes + code_bytes,
             "model_params": n_params,
+            "parquet_path": tracker.parquet_path,
         }
         with open("run_summary.json", "w") as f:
             _json.dump(summary, f, indent=2)

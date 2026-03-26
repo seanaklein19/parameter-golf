@@ -273,16 +273,24 @@ def store_run(
     code_diff: str | None = None,
 ) -> str:
     """Store a completed run in the experiment graph."""
-    from qkv.distill.schema import RunRecord
-
-    record = RunRecord(
-        run_id=summary.get("run_id", "unknown"),
-        num_steps=summary.get("steps", 0),
-        num_layers=config.get("num_layers", 0),
-        wall_time_s=summary.get("wall_time_s", 0.0),
-        loss={"final": summary.get("val_loss", 0.0)},
-        gradient_flow={},
-    )
+    parquet_path = summary.get("parquet_path")
+    if parquet_path and os.path.exists(parquet_path):
+        from qkv.distill import distill_run
+        record = distill_run(parquet_path, config=config)
+        logger.info(f"Distilled {parquet_path}: {record.num_steps} steps, "
+                     f"{len(record.layer_health)} layer health entries, "
+                     f"gradient_flow={record.gradient_flow.get('flow_type', '?')}")
+    else:
+        from qkv.distill.schema import RunRecord
+        logger.warning("No parquet_path in summary, using minimal RunRecord")
+        record = RunRecord(
+            run_id=summary.get("run_id", "unknown"),
+            num_steps=summary.get("steps", 0),
+            num_layers=config.get("num_layers", 0),
+            wall_time_s=summary.get("wall_time_s", 0.0),
+            loss={"final": summary.get("val_loss", 0.0)},
+            gradient_flow={},
+        )
 
     metrics = {
         "val_bpb": summary.get("val_bpb"),
