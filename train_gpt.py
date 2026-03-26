@@ -1060,9 +1060,10 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
-        zero_grad_all()
 
         tracker.step(train_loss, scale)
+
+        zero_grad_all()
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
