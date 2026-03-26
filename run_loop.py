@@ -250,15 +250,27 @@ def orchestrate(
     config: dict,
     train_code: str,
     research_state: str,
+    previous_proposal: dict | None = None,
+    feedback_path: str = "feedback.md",
 ) -> dict:
     """Call the orchestrator agent and return its response."""
     logger.info("Calling orchestrator agent...")
+
+    # Read operator feedback if present
+    feedback = None
+    if os.path.exists(feedback_path):
+        feedback = read_text(feedback_path)
+        if feedback.strip():
+            logger.info(f"Including operator feedback from {feedback_path}")
+
     result = analyze_and_propose(
         run_summary=summary,
         graph=graph,
         config=config,
         train_code=train_code,
         research_state=research_state,
+        previous_proposal=previous_proposal,
+        feedback=feedback,
     )
     logger.info(f"Agent analysis: {result.get('analysis', '?')[:120]}")
     return result
@@ -423,6 +435,7 @@ def main():
             description = "manual run (no proposal)"
 
     iteration = 0
+    previous_proposal = None  # Track for prediction calibration
     while True:
         if args.max_runs and iteration >= args.max_runs:
             logger.info(f"Reached max runs ({args.max_runs})")
@@ -443,11 +456,19 @@ def main():
             )
             print_run_result(iteration, summary, run_id)
 
-            # 3. Orchestrate
+            # 3. Orchestrate (with previous proposal for prediction tracking)
             print_banner("OPUS THINKING...", char="-")
             research_state = read_text(research_state_path)
-            result = orchestrate(graph, summary, config, train_code, research_state)
+            result = orchestrate(
+                graph, summary, config, train_code, research_state,
+                previous_proposal=previous_proposal,
+            )
             print_agent_result(result)
+
+            # Print prediction check if available
+            pred_check = result.get("prediction_check")
+            if pred_check and pred_check != "N/A":
+                print(f"\n  Prediction check: {pred_check}")
 
             # 4. Write insights
             apply_insights(graph, result.get("insights", []))
@@ -475,6 +496,7 @@ def main():
                 break
 
             # Set up next iteration
+            previous_proposal = proposal  # Save for next iteration's prediction check
             parent_ids = proposal.get("parent_ids") or [run_id]
             description = proposal.get("description", "agent proposal")
             iteration += 1
