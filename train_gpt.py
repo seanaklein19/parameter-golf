@@ -867,7 +867,7 @@ def main() -> None:
 
     # QKV capture: per-layer hooks → Parquet (must be before torch.compile)
     from qkv.capture import init as qkv_init
-    tracker = qkv_init(base_model, log_dir="logs", hook_filter="linear", skip_backward=True)
+    tracker = qkv_init(base_model, log_dir="logs", hook_filter="linear", compiled=True)
 
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
