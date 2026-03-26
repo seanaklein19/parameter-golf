@@ -508,6 +508,8 @@ def main():
 
     iteration = 0
     previous_proposal = None
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 5
     while True:
         if args.max_runs and iteration >= args.max_runs:
             logger.info(f"Reached max runs ({args.max_runs})")
@@ -543,13 +545,42 @@ def main():
                     f"({direction} than predicted)"
                 )
 
-            # 4. Orchestrate (agentic tool-use loop)
-            research_state = read_text(research_state_path)
-            result = orchestrate(
-                graph, summary, config, train_code, research_state,
-                previous_proposal=previous_proposal,
-                research_state_path=research_state_path,
-            )
+            # 4. Orchestrate (agentic tool-use loop) — retry on failure
+            result = None
+            for agent_attempt in range(3):
+                try:
+                    research_state = read_text(research_state_path)
+                    result = orchestrate(
+                        graph, summary, config, train_code, research_state,
+                        previous_proposal=previous_proposal,
+                        research_state_path=research_state_path,
+                    )
+                    break
+                except Exception as agent_err:
+                    wait = 30 * (2 ** agent_attempt)
+                    logger.error(
+                        f"Agent failed (attempt {agent_attempt + 1}/3): "
+                        f"{agent_err}"
+                    )
+                    if agent_attempt < 2:
+                        logger.info(f"Retrying agent in {wait}s...")
+                        time.sleep(wait)
+
+            if result is None:
+                logger.error(
+                    "Agent failed 3 times. Skipping analysis, "
+                    "re-running with same config."
+                )
+                consecutive_errors += 1
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    logger.error(
+                        f"{MAX_CONSECUTIVE_ERRORS} consecutive errors, "
+                        f"giving up."
+                    )
+                    break
+                continue
+
+            consecutive_errors = 0
             print_agent_result(result)
 
             # 5. Scoreboard
@@ -630,7 +661,18 @@ def main():
             break
         except Exception as e:
             logger.error(f"Error in iteration {iteration}: {e}", exc_info=True)
-            break
+            consecutive_errors += 1
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                logger.error(
+                    f"{MAX_CONSECUTIVE_ERRORS} consecutive errors, giving up."
+                )
+                break
+            wait = 60 * consecutive_errors
+            logger.info(
+                f"Retrying iteration in {wait}s "
+                f"({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS})..."
+            )
+            time.sleep(wait)
 
     # Final summary
     print_banner("FINAL RESULTS", char="*")
