@@ -99,9 +99,76 @@ def apply_code_patch(train_script: str, diff: str) -> bool:
 # Core loop steps
 # ---------------------------------------------------------------------------
 
+def print_banner(text: str, char: str = "=") -> None:
+    """Print a visible banner to stdout."""
+    width = max(len(text) + 4, 60)
+    print(f"\n{char * width}")
+    print(f"  {text}")
+    print(f"{char * width}")
+
+
+def print_run_result(iteration: int, summary: dict, run_id: str) -> None:
+    """Print training results."""
+    print(f"\n  Run {run_id} complete:")
+    print(f"    val_bpb  = {summary.get('val_bpb', '?')}")
+    print(f"    val_loss = {summary.get('val_loss', '?')}")
+    print(f"    steps    = {summary.get('steps', '?')}")
+    print(f"    time     = {summary.get('wall_time_s', 0):.0f}s")
+    artifact = summary.get("artifact_bytes")
+    if artifact:
+        print(f"    artifact = {artifact / 1e6:.2f} MB / 16.00 MB")
+
+
+def print_agent_result(result: dict) -> None:
+    """Print the agent's analysis and proposal."""
+    print(f"\n  Agent analysis:")
+    print(f"    {result.get('analysis', '(none)')}")
+
+    insights = result.get("insights", [])
+    if insights:
+        print(f"\n  New insights ({len(insights)}):")
+        for ins in insights:
+            print(f"    - {ins.get('insight', '?')}")
+
+    proposal = result.get("proposal")
+    if proposal:
+        print(f"\n  Proposed next experiment:")
+        print(f"    {proposal.get('description', 'unnamed')}")
+        print(f"    Type: {proposal.get('type', '?')}")
+        print(f"    Rationale: {proposal.get('rationale', '?')}")
+        print(f"    Expected: {proposal.get('expected_impact', '?')}")
+        if proposal.get("type") == "config":
+            print(f"    Changes: {json.dumps(proposal.get('changes', {}))}")
+    else:
+        print("\n  Agent has no proposal.")
+
+
+def print_scoreboard(graph: ExperimentGraph) -> None:
+    """Print a scoreboard of all runs."""
+    runs = graph.get_all_runs()
+    best = graph.get_best()
+    best_id = best["run_id"] if best else None
+
+    print(f"\n  Scoreboard ({len(runs)} runs):")
+    print(f"  {'ID':>8}  {'val_bpb':>8}  {'what_changed'}")
+    print(f"  {'-'*8}  {'-'*8}  {'-'*30}")
+    for run in runs:
+        bpb = run["metrics"].get("val_bpb", "?")
+        bpb_str = f"{bpb:.4f}" if isinstance(bpb, (int, float)) else str(bpb)
+        marker = " <-- BEST" if run["run_id"] == best_id else ""
+        what = run.get("what_changed", "?") or "?"
+        print(f"  {run['run_id']:>8}  {bpb_str:>8}  {what[:40]}{marker}")
+
+    insights = graph.get_insights()
+    if insights:
+        print(f"\n  Confirmed insights ({len(insights)}):")
+        for ins in insights:
+            print(f"    - {ins['insight']}")
+
+
 def train(config_path: str, train_script: str, run_id: str) -> dict:
     """Run training and return the run summary."""
-    logger.info(f"=== Training run {run_id} ===")
+    print_banner(f"TRAINING: {run_id}")
 
     env = os.environ.copy()
     env["RUN_ID"] = run_id
@@ -305,6 +372,15 @@ def main():
     train_script = args.train_script
     research_state_path = args.research_state
 
+    print_banner("PARAMETER GOLF — AUTONOMOUS EXPERIMENT LOOP", char="*")
+    print(f"  Config:         {config_path}")
+    print(f"  Train script:   {train_script}")
+    print(f"  Research state: {research_state_path}")
+    print(f"  Database:       {args.db}")
+    print(f"  Mode:           {auto_mode}")
+    if args.max_runs:
+        print(f"  Max runs:       {args.max_runs}")
+
     # Check if this is first run (no experiments yet) or resuming
     all_runs = graph.get_all_runs()
     parent_ids = None
@@ -365,10 +441,13 @@ def main():
                 graph, config, summary, train_code, description,
                 parent_ids=parent_ids,
             )
+            print_run_result(iteration, summary, run_id)
 
             # 3. Orchestrate
+            print_banner("OPUS THINKING...", char="-")
             research_state = read_text(research_state_path)
             result = orchestrate(graph, summary, config, train_code, research_state)
+            print_agent_result(result)
 
             # 4. Write insights
             apply_insights(graph, result.get("insights", []))
@@ -377,19 +456,22 @@ def main():
             if result.get("research_state"):
                 write_text(research_state_path, result["research_state"])
 
-            # 6. Propose next experiment
+            # 6. Scoreboard
+            print_scoreboard(graph)
+
+            # 7. Propose next experiment
             proposal = result.get("proposal")
             if proposal is None:
-                logger.info("Agent has no proposal. Stopping.")
+                print("\n  Agent has no more ideas. Stopping.")
                 break
 
             if not prompt_approval(proposal, auto_mode):
-                logger.info("Proposal not approved. Stopping.")
+                print("\n  Proposal not approved. Stopping.")
                 break
 
-            # 7. Apply proposal
+            # 8. Apply proposal
             if not apply_proposal(proposal, config_path, train_script):
-                logger.warning("Failed to apply proposal. Stopping.")
+                print("\n  Failed to apply proposal. Stopping.")
                 break
 
             # Set up next iteration
@@ -397,9 +479,10 @@ def main():
             description = proposal.get("description", "agent proposal")
             iteration += 1
 
-            logger.info(
-                f"--- Iteration {iteration} complete. "
-                f"Best: {graph.get_best().get('metrics', {}).get('val_bpb', '?')} ---"
+            best_bpb = graph.get_best().get("metrics", {}).get("val_bpb", "?")
+            print_banner(
+                f"ITERATION {iteration} COMPLETE | Best BPB: {best_bpb}",
+                char="=",
             )
 
         except KeyboardInterrupt:
@@ -409,12 +492,14 @@ def main():
             logger.error(f"Error in iteration {iteration}: {e}", exc_info=True)
             break
 
-    # Summary
+    # Final summary
+    print_banner("FINAL RESULTS", char="*")
+    print_scoreboard(graph)
     best = graph.get_best()
     if best:
-        logger.info(f"\nBest run: {best['run_id']} — val_bpb={best['metrics'].get('val_bpb')}")
-    logger.info(f"Total runs in graph: {len(graph.get_all_runs())}")
-    logger.info(f"Insights: {len(graph.get_insights())}")
+        print(f"\n  BEST: {best['run_id']} — val_bpb = {best['metrics'].get('val_bpb')}")
+    print(f"\n  Check research_state.md for the agent's current thinking.")
+    print(f"  Check experiments.db for full history.\n")
     graph.close()
 
 
