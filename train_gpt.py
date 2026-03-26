@@ -19,6 +19,8 @@ import uuid
 import zlib
 from pathlib import Path
 
+import json as _json
+
 import numpy as np
 import sentencepiece as spm
 import torch
@@ -26,6 +28,28 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+# -----------------------------
+# CONFIG FILE LOADING
+# -----------------------------
+# Load config.json (or path from --config arg) before Hyperparameters class reads env vars.
+# Config keys map to env var names (uppercase). Existing env vars take precedence.
+
+def _load_config() -> None:
+    config_path = "config.json"
+    for i, arg in enumerate(sys.argv[1:], 1):
+        if arg == "--config" and i < len(sys.argv):
+            config_path = sys.argv[i + 1]
+            break
+        if arg.startswith("--config="):
+            config_path = arg.split("=", 1)[1]
+            break
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            for k, v in _json.load(f).items():
+                os.environ.setdefault(k.upper(), str(v))
+
+_load_config()
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -1117,6 +1141,21 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # Write machine-readable summary for orchestration loop
+    if master_process:
+        summary = {
+            "run_id": args.run_id,
+            "val_bpb": q_val_bpb,
+            "val_loss": q_val_loss,
+            "train_time_ms": training_time_ms,
+            "steps": step,
+            "artifact_bytes": quant_file_bytes + code_bytes,
+            "model_params": n_params,
+        }
+        with open("run_summary.json", "w") as f:
+            _json.dump(summary, f, indent=2)
+        log0(f"summary written to run_summary.json")
 
     if distributed:
         dist.destroy_process_group()

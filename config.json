@@ -1,0 +1,16 @@
+{
+    "model_dim": 128,
+    "num_layers": 9,
+    "num_heads": 4,
+    "num_kv_heads": 2,
+    "mlp_mult": 2,
+    "vocab_size": 1024,
+    "train_seq_len": 1024,
+    "train_batch_tokens": 131072,
+    "iterations": 200,
+    "warmup_steps": 5,
+    "warmdown_iters": 50,
+    "val_loss_every": 50,
+    "train_log_every": 20,
+    "max_wallclock_seconds": 300
+}
