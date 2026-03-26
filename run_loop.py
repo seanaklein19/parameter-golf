@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Autonomous experiment loop for parameter golf.
 
-Runs train → analyze → propose → apply in a loop.
+Runs train -> analyze -> propose -> apply in a loop.
 Each iteration:
   1. Train with current config (subprocess, A6000)
   2. Read run_summary.json
   3. Store run in ExperimentGraph
-  4. Call orchestrator agent (Bedrock/Anthropic) for analysis + next proposal
-  5. Write insights, update research_state.md
-  6. Apply proposal (config change or code patch)
-  7. Repeat
+  4. Call orchestrator agent (agentic tool-use loop on Bedrock/Anthropic)
+     - Agent investigates graph, records observations/insights,
+       updates research state, proposes next experiment
+  5. Apply proposal (config change or code patch)
+  6. Repeat
 
 Usage:
     # Interactive (approve each proposal):
@@ -96,7 +97,7 @@ def apply_code_patch(train_script: str, diff: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Core loop steps
+# Display helpers
 # ---------------------------------------------------------------------------
 
 def append_log(path: str, entry: dict) -> None:
@@ -125,16 +126,63 @@ def print_run_result(iteration: int, summary: dict, run_id: str) -> None:
         print(f"    artifact = {artifact / 1e6:.2f} MB / 16.00 MB")
 
 
-def print_agent_result(result: dict) -> None:
-    """Print the agent's analysis and proposal."""
-    print(f"\n  Agent analysis:")
-    print(f"    {result.get('analysis', '(none)')}")
+def print_tool_call(tool_name: str, tool_input: dict, result: str) -> None:
+    """Display an agent tool call in real-time."""
+    # Compact input for display
+    if tool_name in ("read_training_code", "read_config", "read_research_state",
+                     "read_feedback", "get_insights", "get_observations"):
+        input_str = ""
+    elif tool_name == "get_run":
+        input_str = f" {tool_input.get('run_id', '?')}"
+    elif tool_name == "compare_runs":
+        input_str = (
+            f" {tool_input.get('run_id_a', '?')} vs "
+            f"{tool_input.get('run_id_b', '?')}"
+        )
+    elif tool_name == "get_lineage":
+        input_str = f" {tool_input.get('run_id', '?')}"
+    elif tool_name == "list_runs":
+        limit = tool_input.get("limit", 0)
+        input_str = f" (limit={limit})" if limit else ""
+    elif tool_name == "add_observation":
+        input_str = f" \"{tool_input.get('observation', '?')[:60]}...\""
+    elif tool_name == "add_insight":
+        input_str = f" \"{tool_input.get('insight', '?')[:60]}...\""
+    elif tool_name == "supersede_insight":
+        input_str = f" #{tool_input.get('old_insight_id', '?')}"
+    elif tool_name == "update_research_state":
+        input_str = f" ({len(tool_input.get('content', ''))} chars)"
+    elif tool_name == "propose_experiment":
+        input_str = f" \"{tool_input.get('description', '?')}\""
+    else:
+        input_str = ""
 
-    insights = result.get("insights", [])
-    if insights:
-        print(f"\n  New insights ({len(insights)}):")
-        for ins in insights:
-            print(f"    - {ins.get('insight', '?')}")
+    # Short result preview
+    result_lines = result.strip().split("\n")
+    result_preview = result_lines[0][:80] if result_lines else ""
+
+    print(f"    [{tool_name}]{input_str}")
+    if tool_name not in ("update_research_state", "read_training_code"):
+        print(f"      -> {result_preview}")
+
+
+def print_agent_result(result: dict) -> None:
+    """Print a summary of the agent's work."""
+    obs = result.get("observations", [])
+    ins = result.get("insights", [])
+    tool_calls = result.get("tool_calls", [])
+
+    print(f"\n  Agent used {len(tool_calls)} tool calls")
+
+    if obs:
+        print(f"\n  Observations recorded ({len(obs)}):")
+        for o in obs:
+            print(f"    - {o[:80]}")
+
+    if ins:
+        print(f"\n  Insights recorded ({len(ins)}):")
+        for i in ins:
+            print(f"    - {i[:80]}")
 
     proposal = result.get("proposal")
     if proposal:
@@ -142,11 +190,18 @@ def print_agent_result(result: dict) -> None:
         print(f"    {proposal.get('description', 'unnamed')}")
         print(f"    Type: {proposal.get('type', '?')}")
         print(f"    Rationale: {proposal.get('rationale', '?')}")
-        print(f"    Expected: {proposal.get('expected_impact', '?')}")
         if proposal.get("type") == "config":
             print(f"    Changes: {json.dumps(proposal.get('changes', {}))}")
+        if proposal.get("predicted_bpb") is not None:
+            print(
+                f"    Predicted BPB: {proposal['predicted_bpb']} "
+                f"(confidence: {proposal.get('confidence', '?')})"
+            )
     else:
         print("\n  Agent has no proposal.")
+
+    if result.get("error"):
+        print(f"\n  ERROR: {result['error']}")
 
 
 def print_scoreboard(graph: ExperimentGraph) -> None:
@@ -171,6 +226,10 @@ def print_scoreboard(graph: ExperimentGraph) -> None:
         for ins in insights:
             print(f"    - {ins['insight']}")
 
+
+# ---------------------------------------------------------------------------
+# Core loop steps
+# ---------------------------------------------------------------------------
 
 def train(config_path: str, train_script: str, run_id: str) -> dict:
     """Run training and return the run summary."""
@@ -198,7 +257,7 @@ def train(config_path: str, train_script: str, run_id: str) -> dict:
     summary = load_json(summary_path)
     summary["wall_time_s"] = elapsed
     logger.info(
-        f"Training done in {elapsed:.0f}s — "
+        f"Training done in {elapsed:.0f}s -- "
         f"val_bpb={summary.get('val_bpb', '?')}"
     )
     return summary
@@ -216,7 +275,6 @@ def store_run(
     """Store a completed run in the experiment graph."""
     from qkv.distill.schema import RunRecord
 
-    # Build a minimal RunRecord for the graph
     record = RunRecord(
         run_id=summary.get("run_id", "unknown"),
         num_steps=summary.get("steps", 0),
@@ -233,7 +291,6 @@ def store_run(
         "model_params": summary.get("model_params"),
         "train_time_ms": summary.get("train_time_ms"),
     }
-    # Remove None values
     metrics = {k: v for k, v in metrics.items() if v is not None}
 
     run_id = graph.add_run(
@@ -258,11 +315,12 @@ def orchestrate(
     research_state: str,
     previous_proposal: dict | None = None,
     feedback_path: str = "feedback.md",
+    research_state_path: str = "research_state.md",
 ) -> dict:
-    """Call the orchestrator agent and return its response."""
-    logger.info("Calling orchestrator agent...")
+    """Call the orchestrator agent (agentic tool-use loop)."""
+    print_banner("OPUS INVESTIGATING...", char="-")
+    print("  Agent tool calls:")
 
-    # Read operator feedback if present
     feedback = None
     if os.path.exists(feedback_path):
         feedback = read_text(feedback_path)
@@ -277,16 +335,10 @@ def orchestrate(
         research_state=research_state,
         previous_proposal=previous_proposal,
         feedback=feedback,
+        research_state_path=research_state_path,
+        on_tool_call=print_tool_call,
     )
-    logger.info(f"Agent analysis: {result.get('analysis', '?')[:120]}")
     return result
-
-
-def apply_insights(graph: ExperimentGraph, insights: list[dict]) -> None:
-    """Write new insights to the graph."""
-    for ins in insights:
-        iid = graph.add_insight(ins["insight"], ins.get("run_ids"))
-        logger.info(f"Added insight #{iid}: {ins['insight'][:80]}")
 
 
 def apply_proposal(proposal: dict, config_path: str, train_script: str) -> bool:
@@ -310,13 +362,11 @@ def apply_proposal(proposal: dict, config_path: str, train_script: str) -> bool:
         if not diff:
             logger.warning("Code proposal has no diff")
             return False
-        # Back up the training script before patching
         backup = train_script + ".bak"
         shutil.copy2(train_script, backup)
         if apply_code_patch(train_script, diff):
             return True
         else:
-            # Restore backup on failure
             shutil.copy2(backup, train_script)
             logger.warning("Patch failed, restored backup")
             return False
@@ -327,10 +377,7 @@ def apply_proposal(proposal: dict, config_path: str, train_script: str) -> bool:
 
 
 def prompt_approval(proposal: dict, auto_mode: str) -> bool:
-    """Check if the proposal should proceed.
-
-    auto_mode: "none" (always ask), "config" (auto-approve config), "all" (auto-approve everything)
-    """
+    """Check if the proposal should proceed."""
     if proposal is None:
         return False
 
@@ -346,7 +393,11 @@ def prompt_approval(proposal: dict, auto_mode: str) -> bool:
     print(f"Proposal: {proposal.get('description', 'unnamed')}")
     print(f"Type: {ptype}")
     print(f"Rationale: {proposal.get('rationale', '?')}")
-    print(f"Expected impact: {proposal.get('expected_impact', '?')}")
+    if proposal.get("predicted_bpb") is not None:
+        print(
+            f"Predicted BPB: {proposal['predicted_bpb']} "
+            f"(confidence: {proposal.get('confidence', '?')})"
+        )
     if ptype == "config":
         print(f"Changes: {json.dumps(proposal.get('changes', {}), indent=2)}")
     elif ptype == "code":
@@ -368,12 +419,16 @@ def prompt_approval(proposal: dict, auto_mode: str) -> bool:
 def main():
     parser = argparse.ArgumentParser(description="Autonomous experiment loop")
     parser.add_argument("--config", default="config.json", help="Config file path")
-    parser.add_argument("--train-script", default="train_gpt.py", help="Training script")
-    parser.add_argument("--research-state", default="research_state.md", help="Research state file")
-    parser.add_argument("--db", default="experiments.db", help="Experiment graph database")
-    parser.add_argument("--max-runs", type=int, default=0, help="Max iterations (0=unlimited)")
+    parser.add_argument("--train-script", default="train_gpt.py",
+                        help="Training script")
+    parser.add_argument("--research-state", default="research_state.md",
+                        help="Research state file")
+    parser.add_argument("--db", default="experiments.db",
+                        help="Experiment graph database")
+    parser.add_argument("--max-runs", type=int, default=0,
+                        help="Max iterations (0=unlimited)")
     parser.add_argument("--auto-config", action="store_true",
-                        help="Auto-approve config changes, prompt for code changes")
+                        help="Auto-approve config changes, prompt for code")
     parser.add_argument("--auto", action="store_true",
                         help="Fully autonomous, no human approval")
     args = parser.parse_args()
@@ -392,7 +447,7 @@ def main():
 
     log_path = "loop_log.jsonl"
 
-    print_banner("PARAMETER GOLF — AUTONOMOUS EXPERIMENT LOOP", char="*")
+    print_banner("PARAMETER GOLF -- AUTONOMOUS EXPERIMENT LOOP", char="*")
     print(f"  Config:         {config_path}")
     print(f"  Train script:   {train_script}")
     print(f"  Research state: {research_state_path}")
@@ -402,37 +457,37 @@ def main():
     if args.max_runs:
         print(f"  Max runs:       {args.max_runs}")
 
-    # Check if this is first run (no experiments yet) or resuming
+    # Check if resuming from existing experiments
     all_runs = graph.get_all_runs()
     parent_ids = None
     description = "baseline"
 
     if all_runs:
-        # Resuming: use the most recent run as parent
         last_run = all_runs[-1]
         parent_ids = [last_run["run_id"]]
         description = "resumed"
         logger.info(f"Resuming from {len(all_runs)} existing runs")
-        logger.info(f"Best so far: val_bpb={graph.get_best().get('metrics', {}).get('val_bpb', '?')}")
+        best = graph.get_best()
+        logger.info(
+            f"Best so far: val_bpb="
+            f"{best.get('metrics', {}).get('val_bpb', '?') if best else '?'}"
+        )
 
-        # If resuming, skip straight to orchestration with the last run
-        # to get a proposal for the next experiment
         config = load_json(config_path)
         train_code = read_text(train_script)
         research_state = read_text(research_state_path)
 
-        # Use the last run's metrics as the summary
         last_summary = {
             "run_id": last_run["run_id"],
             "val_bpb": last_run["metrics"].get("val_bpb"),
             "val_loss": last_run["metrics"].get("val_loss"),
         }
 
-        result = orchestrate(graph, last_summary, config, train_code, research_state)
-        apply_insights(graph, result.get("insights", []))
-
-        if result.get("research_state"):
-            write_text(research_state_path, result["research_state"])
+        result = orchestrate(
+            graph, last_summary, config, train_code, research_state,
+            research_state_path=research_state_path,
+        )
+        print_agent_result(result)
 
         proposal = result.get("proposal")
         if proposal and prompt_approval(proposal, auto_mode):
@@ -444,7 +499,7 @@ def main():
             description = "manual run (no proposal)"
 
     iteration = 0
-    previous_proposal = None  # Track for prediction calibration
+    previous_proposal = None
     while True:
         if args.max_runs and iteration >= args.max_runs:
             logger.info(f"Reached max runs ({args.max_runs})")
@@ -465,62 +520,49 @@ def main():
             )
             print_run_result(iteration, summary, run_id)
 
-            # 2b. Check prediction from previous iteration
+            # 3. Check prediction from previous iteration
             actual_bpb = summary.get("val_bpb")
-            if previous_proposal and previous_proposal.get("predicted_bpb") is not None:
+            if (previous_proposal
+                    and previous_proposal.get("predicted_bpb") is not None):
                 predicted = previous_proposal["predicted_bpb"]
                 delta = actual_bpb - predicted
                 direction = "WORSE" if delta > 0 else "BETTER"
                 print(f"\n  Prediction vs reality:")
                 print(f"    Predicted: {predicted:.4f}")
                 print(f"    Actual:    {actual_bpb:.4f}")
-                print(f"    Delta:     {delta:+.4f} ({direction} than predicted)")
+                print(
+                    f"    Delta:     {delta:+.4f} "
+                    f"({direction} than predicted)"
+                )
 
-            # 3. Orchestrate (with previous proposal for prediction tracking)
-            print_banner("OPUS THINKING...", char="-")
+            # 4. Orchestrate (agentic tool-use loop)
             research_state = read_text(research_state_path)
             result = orchestrate(
                 graph, summary, config, train_code, research_state,
                 previous_proposal=previous_proposal,
+                research_state_path=research_state_path,
             )
             print_agent_result(result)
 
-            # Print prediction check if available
-            pred_check = result.get("prediction_check")
-            if pred_check and pred_check != "N/A":
-                print(f"\n  Agent's self-assessment: {pred_check}")
-
-            # 4. Write insights
-            apply_insights(graph, result.get("insights", []))
-
-            # 5. Update research state
-            if result.get("research_state"):
-                write_text(research_state_path, result["research_state"])
-
-            # 6. Scoreboard
+            # 5. Scoreboard
             print_scoreboard(graph)
 
-            # 7. Propose next experiment
+            # 6. Propose next experiment
             proposal = result.get("proposal")
             if proposal is None:
                 print("\n  Agent has no more ideas. Stopping.")
                 break
 
-            # Show the prediction for next run
-            if proposal.get("predicted_bpb") is not None:
-                print(f"\n  Next prediction: val_bpb = {proposal['predicted_bpb']}"
-                      f" (confidence: {proposal.get('confidence', '?')})")
-
             if not prompt_approval(proposal, auto_mode):
                 print("\n  Proposal not approved. Stopping.")
                 break
 
-            # 8. Apply proposal
+            # 7. Apply proposal
             if not apply_proposal(proposal, config_path, train_script):
                 print("\n  Failed to apply proposal. Stopping.")
                 break
 
-            # 9. Log this iteration for meta-analysis
+            # 8. Log this iteration for meta-analysis
             log_entry = {
                 "iteration": iteration,
                 "timestamp": time.time(),
@@ -530,27 +572,41 @@ def main():
                 "actual_bpb": actual_bpb,
                 "actual_loss": summary.get("val_loss"),
                 "train_time_s": summary.get("wall_time_s"),
-                "predicted_bpb": (previous_proposal.get("predicted_bpb")
-                                  if previous_proposal else None),
-                "prediction_confidence": (previous_proposal.get("confidence")
-                                          if previous_proposal else None),
-                "prediction_error": (actual_bpb - previous_proposal["predicted_bpb"]
-                                     if previous_proposal
-                                     and previous_proposal.get("predicted_bpb") is not None
-                                     and actual_bpb is not None
-                                     else None),
-                "agent_analysis": result.get("analysis"),
-                "agent_prediction_check": result.get("prediction_check"),
-                "insights_added": [i.get("insight") for i in result.get("insights", [])],
-                "next_proposal": proposal.get("description") if proposal else None,
-                "next_predicted_bpb": proposal.get("predicted_bpb") if proposal else None,
-                "next_confidence": proposal.get("confidence") if proposal else None,
-                "best_bpb_so_far": graph.get_best().get("metrics", {}).get("val_bpb"),
+                "predicted_bpb": (
+                    previous_proposal.get("predicted_bpb")
+                    if previous_proposal else None
+                ),
+                "prediction_confidence": (
+                    previous_proposal.get("confidence")
+                    if previous_proposal else None
+                ),
+                "prediction_error": (
+                    actual_bpb - previous_proposal["predicted_bpb"]
+                    if previous_proposal
+                    and previous_proposal.get("predicted_bpb") is not None
+                    and actual_bpb is not None
+                    else None
+                ),
+                "observations": result.get("observations", []),
+                "insights": result.get("insights", []),
+                "tool_calls_count": len(result.get("tool_calls", [])),
+                "next_proposal": (
+                    proposal.get("description") if proposal else None
+                ),
+                "next_predicted_bpb": (
+                    proposal.get("predicted_bpb") if proposal else None
+                ),
+                "next_confidence": (
+                    proposal.get("confidence") if proposal else None
+                ),
+                "best_bpb_so_far": (
+                    graph.get_best().get("metrics", {}).get("val_bpb")
+                ),
             }
             append_log(log_path, log_entry)
 
             # Set up next iteration
-            previous_proposal = proposal  # Save for next iteration's prediction check
+            previous_proposal = proposal
             parent_ids = proposal.get("parent_ids") or [run_id]
             description = proposal.get("description", "agent proposal")
             iteration += 1
@@ -573,9 +629,12 @@ def main():
     print_scoreboard(graph)
     best = graph.get_best()
     if best:
-        print(f"\n  BEST: {best['run_id']} — val_bpb = {best['metrics'].get('val_bpb')}")
+        print(
+            f"\n  BEST: {best['run_id']} -- "
+            f"val_bpb = {best['metrics'].get('val_bpb')}"
+        )
     print(f"\n  Check research_state.md for the agent's current thinking.")
-    print(f"  Check experiments.db for full history.")
+    print(f"  Check experiments.db for full history (runs + observations + insights).")
     print(f"  Check loop_log.jsonl for meta-analysis (bring to Claude Code).\n")
     graph.close()
 

@@ -1,4 +1,4 @@
-"""Tests for run_loop.py — the autonomous experiment loop."""
+"""Tests for run_loop.py -- the autonomous experiment loop."""
 
 import json
 import os
@@ -13,7 +13,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from run_loop import (
     apply_code_patch,
-    apply_insights,
     apply_proposal,
     load_json,
     prompt_approval,
@@ -91,7 +90,7 @@ class TestJsonHelpers:
 
 
 # ---------------------------------------------------------------------------
-# apply_proposal — config changes
+# apply_proposal -- config changes
 # ---------------------------------------------------------------------------
 
 class TestApplyProposalConfig:
@@ -126,7 +125,7 @@ class TestApplyProposalConfig:
 
 
 # ---------------------------------------------------------------------------
-# apply_proposal — code patches
+# apply_proposal -- code patches
 # ---------------------------------------------------------------------------
 
 class TestApplyProposalCode:
@@ -221,27 +220,6 @@ class TestStoreRun:
 
 
 # ---------------------------------------------------------------------------
-# apply_insights
-# ---------------------------------------------------------------------------
-
-class TestApplyInsights:
-    def test_adds_insights_to_graph(self, graph):
-        insights = [
-            {"insight": "SwiGLU > relu^2", "run_ids": ["abc"]},
-            {"insight": "grad clip helps"},
-        ]
-        apply_insights(graph, insights)
-        stored = graph.get_insights()
-        assert len(stored) == 2
-        assert stored[0]["insight"] == "SwiGLU > relu^2"
-        assert stored[1]["insight"] == "grad clip helps"
-
-    def test_empty_insights(self, graph):
-        apply_insights(graph, [])
-        assert graph.get_insights() == []
-
-
-# ---------------------------------------------------------------------------
 # prompt_approval
 # ---------------------------------------------------------------------------
 
@@ -316,12 +294,12 @@ class TestTrain:
 
 
 # ---------------------------------------------------------------------------
-# Integration: store → insights → proposal → apply cycle
+# Integration: store -> proposal -> apply cycle
 # ---------------------------------------------------------------------------
 
 class TestIntegrationCycle:
     def test_full_cycle(self, graph, config_file):
-        """Simulate one full iteration: store run, add insights, apply config proposal."""
+        """Simulate one full iteration: store run, apply config proposal."""
         # 1. Store a run
         summary = {
             "run_id": "baseline_001",
@@ -333,36 +311,34 @@ class TestIntegrationCycle:
         config = load_json(config_file)
         run_id = store_run(graph, config, summary, "import torch", "baseline")
 
-        # 2. Agent returns analysis
-        agent_result = {
-            "analysis": "Baseline is 2.45 BPB",
-            "insights": [
-                {"insight": "baseline dim=128 is 2.45 BPB", "run_ids": [run_id]}
-            ],
-            "research_state": "# Updated state\n",
-            "proposal": {
-                "description": "try swiglu",
-                "type": "config",
-                "changes": {"activation": "swiglu", "mlp_mult": 3},
-                "rationale": "SwiGLU commonly helps",
-                "parent_ids": [run_id],
-                "expected_impact": "~0.03 BPB",
-            },
-        }
-
-        # 3. Apply insights
-        apply_insights(graph, agent_result["insights"])
+        # 2. Agent records observations/insights via tools (simulated)
+        graph.add_observation(
+            "baseline dim=128 gives 2.45 BPB", run_ids=[run_id],
+        )
+        graph.add_insight(
+            "baseline dim=128 is 2.45 BPB", run_ids=[run_id],
+        )
         assert len(graph.get_insights()) == 1
+        assert len(graph.get_observations()) == 1
 
-        # 4. Apply proposal
-        result = apply_proposal(agent_result["proposal"], config_file, "unused.py")
+        # 3. Apply proposal
+        proposal = {
+            "description": "try swiglu",
+            "type": "config",
+            "changes": {"activation": "swiglu", "mlp_mult": 3},
+            "rationale": "SwiGLU commonly helps",
+            "parent_ids": [run_id],
+            "predicted_bpb": 2.42,
+            "confidence": "medium",
+        }
+        result = apply_proposal(proposal, config_file, "unused.py")
         assert result is True
 
         updated = load_json(config_file)
         assert updated["activation"] == "swiglu"
         assert updated["mlp_mult"] == 3
 
-        # 5. Store next run with parent
+        # 4. Store next run with parent
         summary2 = {
             "run_id": "swiglu_001",
             "val_bpb": 2.42,
