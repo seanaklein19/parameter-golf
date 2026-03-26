@@ -99,6 +99,12 @@ def apply_code_patch(train_script: str, diff: str) -> bool:
 # Core loop steps
 # ---------------------------------------------------------------------------
 
+def append_log(path: str, entry: dict) -> None:
+    """Append a structured log entry to the iteration log (JSONL)."""
+    with open(path, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
 def print_banner(text: str, char: str = "=") -> None:
     """Print a visible banner to stdout."""
     width = max(len(text) + 4, 60)
@@ -384,11 +390,14 @@ def main():
     train_script = args.train_script
     research_state_path = args.research_state
 
+    log_path = "loop_log.jsonl"
+
     print_banner("PARAMETER GOLF — AUTONOMOUS EXPERIMENT LOOP", char="*")
     print(f"  Config:         {config_path}")
     print(f"  Train script:   {train_script}")
     print(f"  Research state: {research_state_path}")
     print(f"  Database:       {args.db}")
+    print(f"  Iteration log:  {log_path}")
     print(f"  Mode:           {auto_mode}")
     if args.max_runs:
         print(f"  Max runs:       {args.max_runs}")
@@ -456,6 +465,17 @@ def main():
             )
             print_run_result(iteration, summary, run_id)
 
+            # 2b. Check prediction from previous iteration
+            actual_bpb = summary.get("val_bpb")
+            if previous_proposal and previous_proposal.get("predicted_bpb") is not None:
+                predicted = previous_proposal["predicted_bpb"]
+                delta = actual_bpb - predicted
+                direction = "WORSE" if delta > 0 else "BETTER"
+                print(f"\n  Prediction vs reality:")
+                print(f"    Predicted: {predicted:.4f}")
+                print(f"    Actual:    {actual_bpb:.4f}")
+                print(f"    Delta:     {delta:+.4f} ({direction} than predicted)")
+
             # 3. Orchestrate (with previous proposal for prediction tracking)
             print_banner("OPUS THINKING...", char="-")
             research_state = read_text(research_state_path)
@@ -468,7 +488,7 @@ def main():
             # Print prediction check if available
             pred_check = result.get("prediction_check")
             if pred_check and pred_check != "N/A":
-                print(f"\n  Prediction check: {pred_check}")
+                print(f"\n  Agent's self-assessment: {pred_check}")
 
             # 4. Write insights
             apply_insights(graph, result.get("insights", []))
@@ -486,6 +506,11 @@ def main():
                 print("\n  Agent has no more ideas. Stopping.")
                 break
 
+            # Show the prediction for next run
+            if proposal.get("predicted_bpb") is not None:
+                print(f"\n  Next prediction: val_bpb = {proposal['predicted_bpb']}"
+                      f" (confidence: {proposal.get('confidence', '?')})")
+
             if not prompt_approval(proposal, auto_mode):
                 print("\n  Proposal not approved. Stopping.")
                 break
@@ -494,6 +519,35 @@ def main():
             if not apply_proposal(proposal, config_path, train_script):
                 print("\n  Failed to apply proposal. Stopping.")
                 break
+
+            # 9. Log this iteration for meta-analysis
+            log_entry = {
+                "iteration": iteration,
+                "timestamp": time.time(),
+                "run_id": run_id,
+                "description": description,
+                "config": config,
+                "actual_bpb": actual_bpb,
+                "actual_loss": summary.get("val_loss"),
+                "train_time_s": summary.get("wall_time_s"),
+                "predicted_bpb": (previous_proposal.get("predicted_bpb")
+                                  if previous_proposal else None),
+                "prediction_confidence": (previous_proposal.get("confidence")
+                                          if previous_proposal else None),
+                "prediction_error": (actual_bpb - previous_proposal["predicted_bpb"]
+                                     if previous_proposal
+                                     and previous_proposal.get("predicted_bpb") is not None
+                                     and actual_bpb is not None
+                                     else None),
+                "agent_analysis": result.get("analysis"),
+                "agent_prediction_check": result.get("prediction_check"),
+                "insights_added": [i.get("insight") for i in result.get("insights", [])],
+                "next_proposal": proposal.get("description") if proposal else None,
+                "next_predicted_bpb": proposal.get("predicted_bpb") if proposal else None,
+                "next_confidence": proposal.get("confidence") if proposal else None,
+                "best_bpb_so_far": graph.get_best().get("metrics", {}).get("val_bpb"),
+            }
+            append_log(log_path, log_entry)
 
             # Set up next iteration
             previous_proposal = proposal  # Save for next iteration's prediction check
@@ -521,7 +575,8 @@ def main():
     if best:
         print(f"\n  BEST: {best['run_id']} — val_bpb = {best['metrics'].get('val_bpb')}")
     print(f"\n  Check research_state.md for the agent's current thinking.")
-    print(f"  Check experiments.db for full history.\n")
+    print(f"  Check experiments.db for full history.")
+    print(f"  Check loop_log.jsonl for meta-analysis (bring to Claude Code).\n")
     graph.close()
 
 
