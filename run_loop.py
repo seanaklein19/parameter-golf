@@ -248,6 +248,7 @@ def train(config_path: str, train_script: str, run_id: str) -> dict:
 
     env = os.environ.copy()
     env["RUN_ID"] = run_id
+    env["PYTHONUNBUFFERED"] = "1"
 
     # Remove run_summary.json from previous run
     summary_path = "run_summary.json"
