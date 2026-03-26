@@ -33,7 +33,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -72,28 +71,40 @@ def write_text(path: str, content: str) -> None:
         f.write(content)
 
 
-def apply_code_patch(train_script: str, diff: str) -> bool:
-    """Apply a unified diff patch to the training script.
+def apply_code_edits(train_script: str, edits: list[dict]) -> bool:
+    """Apply search-and-replace edits to the training script.
 
+    Each edit is a dict with 'old_text' and 'new_text'.
     Returns True on success, False on failure.
     """
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False) as f:
-        f.write(diff)
-        patch_path = f.name
+    with open(train_script) as f:
+        content = f.read()
 
-    try:
-        result = subprocess.run(
-            ["patch", "--forward", "--reject-file=-", train_script, patch_path],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0:
-            logger.info("Code patch applied successfully")
-            return True
-        else:
-            logger.error(f"Patch failed: {result.stderr}")
+    for i, edit in enumerate(edits):
+        old_text = edit.get("old_text", "")
+        new_text = edit.get("new_text", "")
+        if not old_text:
+            logger.error(f"Edit {i}: empty old_text")
             return False
-    finally:
-        os.unlink(patch_path)
+        if old_text not in content:
+            logger.error(
+                f"Edit {i}: old_text not found in {train_script}\n"
+                f"  Looking for: {old_text[:100]}..."
+            )
+            return False
+        count = content.count(old_text)
+        if count > 1:
+            logger.error(
+                f"Edit {i}: old_text matches {count} locations (must be unique)\n"
+                f"  Text: {old_text[:100]}..."
+            )
+            return False
+        content = content.replace(old_text, new_text, 1)
+
+    with open(train_script, "w") as f:
+        f.write(content)
+    logger.info(f"Applied {len(edits)} code edit(s) successfully")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -366,17 +377,17 @@ def apply_proposal(proposal: dict, config_path: str, train_script: str) -> bool:
         return True
 
     elif ptype == "code":
-        diff = proposal.get("diff", "")
-        if not diff:
-            logger.warning("Code proposal has no diff")
+        edits = proposal.get("edits", [])
+        if not edits:
+            logger.warning("Code proposal has no edits")
             return False
         backup = train_script + ".bak"
         shutil.copy2(train_script, backup)
-        if apply_code_patch(train_script, diff):
+        if apply_code_edits(train_script, edits):
             return True
         else:
             shutil.copy2(backup, train_script)
-            logger.warning("Patch failed, restored backup")
+            logger.warning("Code edits failed, restored backup")
             return False
 
     else:
@@ -409,7 +420,11 @@ def prompt_approval(proposal: dict, auto_mode: str) -> bool:
     if ptype == "config":
         print(f"Changes: {json.dumps(proposal.get('changes', {}), indent=2)}")
     elif ptype == "code":
-        print(f"Diff:\n{proposal.get('diff', '(empty)')}")
+        edits = proposal.get("edits", [])
+        print(f"Edits ({len(edits)}):")
+        for i, edit in enumerate(edits):
+            print(f"  [{i}] Replace: {edit.get('old_text', '')[:80]}...")
+            print(f"      With:    {edit.get('new_text', '')[:80]}...")
     print(f"{'='*60}")
 
     while True:
@@ -598,8 +613,14 @@ def main():
 
             # 7. Apply proposal
             if not apply_proposal(proposal, config_path, train_script):
-                print("\n  Failed to apply proposal. Stopping.")
-                break
+                logger.warning(
+                    "Failed to apply proposal, re-running with current config"
+                )
+                description = "retry (failed to apply previous proposal)"
+                parent_ids = [run_id]
+                previous_proposal = proposal
+                iteration += 1
+                continue
 
             # 8. Log this iteration for meta-analysis
             log_entry = {
