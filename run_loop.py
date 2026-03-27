@@ -605,7 +605,13 @@ def main():
             # 6. Propose next experiment
             proposal = result.get("proposal")
             if proposal is None:
-                print("\n  Agent has no more ideas. Stopping.")
+                print("\n" + "!" * 60)
+                print("  STOPPED: Agent returned no proposal.")
+                if result.get("error"):
+                    print(f"  Error: {result['error']}")
+                print(f"  Tool calls used: {len(result.get('tool_calls', []))}")
+                print(f"  Observations: {result.get('observations', [])}")
+                print("!" * 60)
                 break
 
             if not prompt_approval(proposal, auto_mode):
