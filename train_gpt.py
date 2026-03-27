@@ -628,17 +628,17 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
+    # SwiGLU MLP
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
+        self.gate = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        return self.proj(F.silu(self.gate(x)) * self.fc(x))
 
 
 class Block(nn.Module):
@@ -951,15 +951,21 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
-        if args.warmdown_iters <= 0:
+        # Linear warmup over first 50 steps
+        lr_warmup_steps = 50
+        if step < lr_warmup_steps:
+            return step / lr_warmup_steps if lr_warmup_steps > 0 else 1.0
+        # Step-based linear warmdown
+        if max_wallclock_ms is not None and max_wallclock_ms > 0:
+            remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+            warmdown_ms = 1000.0 * args.warmdown_iters * (elapsed_ms / max(step, 1))
+            if remaining_ms <= warmdown_ms and warmdown_ms > 0:
+                return remaining_ms / warmdown_ms
             return 1.0
-        if max_wallclock_ms is None:
-            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-        step_ms = elapsed_ms / max(step, 1)
-        warmdown_ms = args.warmdown_iters * step_ms
-        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+        warmdown_start = args.iterations - args.warmdown_iters
+        if step >= warmdown_start and args.warmdown_iters > 0:
+            return max(0.0, (args.iterations - step) / args.warmdown_iters)
+        return 1.0
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.

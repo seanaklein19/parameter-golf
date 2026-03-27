@@ -256,12 +256,33 @@ def train(config_path: str, train_script: str, run_id: str) -> dict:
         os.remove(summary_path)
 
     cmd = [sys.executable, train_script, "--config", config_path]
+    log_file = f"logs/{run_id}.txt"
     t0 = time.time()
-    result = subprocess.run(cmd, env=env)
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
     elapsed = time.time() - t0
 
+    # Write stdout/stderr to log file
+    os.makedirs("logs", exist_ok=True)
+    with open(log_file, "w") as f:
+        if result.stdout:
+            f.write(result.stdout)
+        if result.stderr:
+            f.write(result.stderr)
+
+    # Print output so it's still visible
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+
     if result.returncode != 0:
-        raise RuntimeError(f"Training failed with exit code {result.returncode}")
+        # Include last 50 lines of output for error diagnosis
+        error_output = (result.stderr or result.stdout or "no output captured")
+        error_lines = error_output.strip().split("\n")
+        error_tail = "\n".join(error_lines[-50:])
+        err = RuntimeError(f"Training failed with exit code {result.returncode}")
+        err.error_tail = error_tail
+        raise err
 
     if not os.path.exists(summary_path):
         raise RuntimeError("Training completed but run_summary.json not found")
@@ -336,9 +357,13 @@ def orchestrate(
     previous_proposal: dict | None = None,
     feedback_path: str = "feedback.md",
     research_state_path: str = "research_state.md",
+    error_context: str | None = None,
 ) -> dict:
     """Call the orchestrator agent (agentic tool-use loop)."""
-    print_banner("OPUS INVESTIGATING...", char="-")
+    if error_context:
+        print_banner("OPUS DIAGNOSING ERROR...", char="-")
+    else:
+        print_banner("OPUS INVESTIGATING...", char="-")
     print("  Agent tool calls:")
 
     feedback = None
@@ -357,6 +382,7 @@ def orchestrate(
         feedback=feedback,
         research_state_path=research_state_path,
         on_tool_call=print_tool_call,
+        error_context=error_context,
     )
     return result
 
@@ -695,6 +721,41 @@ def main():
                     f"{MAX_CONSECUTIVE_ERRORS} consecutive errors, giving up."
                 )
                 break
+
+            # If training failed and we have error output, ask agent to fix it
+            error_tail = getattr(e, "error_tail", None)
+            if error_tail:
+                logger.info("Asking agent to diagnose and fix training error...")
+                try:
+                    config = load_json(config_path)
+                    train_code = read_text(train_script)
+                    research_state = read_text(research_state_path)
+                    fix_result = orchestrate(
+                        graph,
+                        {},  # no run summary — training failed
+                        config,
+                        train_code,
+                        research_state,
+                        previous_proposal=previous_proposal,
+                        research_state_path=research_state_path,
+                        error_context=error_tail,
+                    )
+                    print_agent_result(fix_result)
+
+                    fix_proposal = fix_result.get("proposal")
+                    if fix_proposal and prompt_approval(fix_proposal, auto_mode):
+                        if apply_proposal(fix_proposal, config_path, train_script):
+                            description = fix_proposal.get(
+                                "description", "error fix"
+                            )
+                            previous_proposal = fix_proposal
+                            logger.info(
+                                "Applied fix, retrying training immediately"
+                            )
+                            continue
+                except Exception as fix_err:
+                    logger.error(f"Agent fix attempt failed: {fix_err}")
+
             wait = 60 * consecutive_errors
             logger.info(
                 f"Retrying iteration in {wait}s "
